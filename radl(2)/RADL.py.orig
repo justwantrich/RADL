@@ -1,0 +1,248 @@
+"""Training entry point for the RADL forecasting implementation.
+
+Loads data through the shared preprocessing path, fits the dependency-aware
+backbone selected in config, and writes checkpoints and test metrics using
+the existing layout under ./save_dict and ./output.
+"""
+import argparse
+import time
+import pandas as pd
+import random
+import numpy as np
+import torch
+import torch.optim as optim
+
+from load_data import load_EOD_data, prepare_dataloaders
+from tool import train, test
+from config import get_args
+from set_model import get_model
+
+
+def inspect_data(eod_data, train_loader, valid_loader, test_loader, args, a, b):
+    sep = "=" * 70
+    print(f"\n{sep}")
+    print("                    DATA INSPECTION REPORT")
+    print(sep)
+
+    # --- 1. Raw data preview ---
+    print("\n[1] Raw Data Preview (eod_data after standardization)")
+    print(f"    eod_data.shape: {eod_data.shape}  "
+          f"-> (code_num={args.code_num}, trade_day={args.trade_day}, fea_num={args.fea_num})")
+    print(f"    First 5 time steps of variable 0:")
+    print(f"      {eod_data[0, :5, 0]}")
+    print(f"    First 5 time steps of variable 1:")
+    print(f"      {eod_data[1, :5, 0]}")
+
+    # --- 2. Batch dimension check ---
+    print("\n[2] Batch Dimension Check")
+    for name, loader in [("Train", train_loader), ("Valid", valid_loader), ("Test", test_loader)]:
+        for X, y in loader:
+            print(f"    {name:5s} -> X.shape: {tuple(X.shape)}, y.shape: {tuple(y.shape)}")
+            break
+    print(f"    Expected X: (batch, {args.code_num}, {args.length}, {args.fea_num})")
+    print(f"    Expected y: (batch, {args.code_num}, {args.forecast_horizon})")
+
+    # --- 3. Dataset split ---
+    print("\n[3] Dataset Split")
+    print(f"    Train samples : {len(train_loader.dataset):>6d}   batches: {len(train_loader)}")
+    print(f"    Valid samples : {len(valid_loader.dataset):>6d}   batches: {len(valid_loader)}")
+    print(f"    Test  samples : {len(test_loader.dataset):>6d}   batches: {len(test_loader)}")
+
+    # --- 4. Alignment check ---
+    print("\n[4] Alignment Check (first batch)")
+    for X, y in train_loader:
+        batch_match = X.shape[0] == y.shape[0]
+        code_match = X.shape[1] == y.shape[1]
+        print(f"    Batch dim match (X[0]==y[0]): {batch_match}")
+        print(f"    Code  dim match (X[1]==y[1]): {code_match}")
+        print(f"    X[0, 0, :5, 0] = {X[0, 0, :5, 0].numpy()}")
+        print(f"    y[0, 0, :]     = {y[0, 0, :].numpy()}")
+        break
+
+    # --- 5. Statistical features ---
+    print("\n[5] Statistical Features (per variable, standardized)")
+    print(f"    {'Var':>4s}  {'Mean':>9s}  {'Std':>9s}  {'Min':>9s}  {'Max':>9s}  {'NaN':>5s}")
+    print(f"    {'-'*50}")
+    for i in range(args.code_num):
+        vals = eod_data[i, :, 0]
+        print(f"    {i:4d}  {np.mean(vals):+9.4f}  {np.std(vals):9.4f}  "
+              f"{np.min(vals):+9.4f}  {np.max(vals):+9.4f}  {np.isnan(vals).sum():5d}")
+
+    # --- 6. Standardization parameters ---
+    print(f"\n[6] Standardization Method: {args.standardization}")
+    if args.standardization == "z-score" and a and b:
+        col_names = getattr(args, 'feature_names', [])
+        print(f"    {'Var':>4s}  {'Name':<12s}  {'Mean(a)':>10s}  {'Std(b)':>10s}")
+        print(f"    {'-'*42}")
+        for i in range(args.code_num):
+            vname = col_names[i] if i < len(col_names) else f"Var_{i}"
+            print(f"    {i:4d}  {vname:<12s}  {a[i]:10.4f}  {b[i]:10.4f}")
+
+    print(f"\n{sep}")
+    print("                  DATA INSPECTION COMPLETE")
+    print(f"{sep}\n")
+
+
+def print_config(args):
+    sep = "=" * 70
+    print(f"\n{sep}")
+    print("                    TRAINING CONFIGURATION")
+    print(sep)
+    print(f"  Data path         : {args.data_path}")
+    print(f"  Model             : {args.model_name}")
+    print(f"  Forecast horizon  : {args.forecast_horizon}")
+    print(f"  Sequence length   : {args.length}")
+    print(f"  Code num          : {args.code_num}")
+    print(f"  Trade days        : {args.trade_day}")
+    print(f"  Train index       : {args.train_index}")
+    print(f"  Valid index        : {args.valid_index}")
+    print(f"  Batch size        : {args.batch_size}")
+    print(f"  Epochs            : {args.epoch}")
+    print(f"  Learning rate     : {args.lr}")
+    print(f"  Weight decay      : {args.weight_decay}")
+    print(f"  Dropout           : {args.dropout}")
+    print(f"  Hidden size       : {args.hidden_size}")
+    print(f"  Standardization   : {args.standardization}")
+    print(f"  Seed              : {args.seed}")
+    print(f"  CUDA              : {args.cuda}")
+    print(f"  --- RADL forecasting pipeline ---")
+    print(f"  Instance-level adaptation (use_revin): {getattr(args, 'use_revin', False)}")
+    print(f"  Low-capacity backbone (compact_mode) : {getattr(args, 'compact_mode', False)}")
+    gating = getattr(args, 'gating_method', 'none')
+    print(f"  Gating method     : {gating}")
+    if gating != "none":
+        print(f"    bottleneck_lambda : {args.bottleneck_lambda}")
+        print(f"    gate_lr_scale     : {getattr(args, 'gate_lr_scale', 10.0)}x")
+        if gating == "sigmoid":
+            print(f"    bottleneck_warmup : {getattr(args, 'bottleneck_warmup', 100)} epochs")
+        elif gating == "gumbel":
+            print(f"    tau               : {args.gumbel_tau_start} -> {args.gumbel_tau_end}")
+    aux_w = getattr(args, 'aux_loss_weight', 0.0)
+    if aux_w > 0:
+        print(f"  Aux loss weight   : {aux_w}")
+    es = getattr(args, 'early_stop_patience', 0)
+    if es > 0:
+        print(f"  Early stop        : patience={es}")
+    if getattr(args, 'use_cosine_lr', False):
+        print(f"  LR schedule       : CosineAnnealing")
+    print(sep)
+
+
+def print_model_info(model, args, device):
+    sep = "=" * 70
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    prior_params = [n for n, _ in model.named_parameters() if "prior" in n.lower()]
+    if prior_params:
+        raise ValueError(f"Model Parameter Check FAILED: found prior-related params: {prior_params}")
+    print(f"\n{sep}")
+    print("                       MODEL SUMMARY")
+    print(sep)
+    print(f"  Model name      : {args.model_name}")
+    print(f"  Device          : {device}")
+    print(f"  Total params    : {total_params:>12,d}")
+    print(f"  Trainable params: {trainable_params:>12,d}")
+    if getattr(args, 'compact_mode', False):
+        print(f"  Backbone layout : compact preset (blocks=2, layers=2)")
+    print(sep, "\n")
+
+
+def main(args):
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available() and args.cuda:
+        torch.cuda.manual_seed_all(args.seed)
+
+    eod_data, a, b = load_EOD_data(args)
+    train_loader, valid_loader, test_loader = prepare_dataloaders(eod_data, args)
+
+    inspect_data(eod_data, train_loader, valid_loader, test_loader, args, a, b)
+
+    device = torch.device('cuda' if args.cuda and torch.cuda.is_available() else 'cpu')
+    model = get_model(device, args)
+
+    print_model_info(model, args, device)
+
+    gating = getattr(args, 'gating_method', 'none')
+    if gating in ("sigmoid", "gumbel"):
+        gate_params = [p for n, p in model.named_parameters() if 'bottleneck_logits' in n]
+        other_params = [p for n, p in model.named_parameters() if 'bottleneck_logits' not in n]
+        gate_lr = args.lr * getattr(args, 'gate_lr_scale', 10.0)
+        optimizer = optim.Adam([
+            {'params': other_params},
+            {'params': gate_params, 'lr': gate_lr},
+        ], lr=args.lr)
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=args.lr)
+
+    scheduler = None
+    if getattr(args, 'use_cosine_lr', False):
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epoch, eta_min=args.lr * 0.01)
+
+    train(model, train_loader, valid_loader, optimizer, device, args, a, b, scheduler=scheduler)
+
+    all_result = pd.DataFrame()
+    result = test(model, test_loader, optimizer, device, args, a, b)
+    all_result = pd.concat([all_result, result])
+
+    if gating in ("sigmoid", "gumbel") and hasattr(model, 'st_gating'):
+        _print_gating_summary(model, test_loader, device, args)
+
+    return all_result
+
+
+def _print_gating_summary(model, test_loader, device, args):
+    """Average test-set gating weights and print a ranked variable-importance table."""
+    model.eval()
+    gate_accum = None
+    n_samples = 0
+    with torch.no_grad():
+        for eod, _ in test_loader:
+            eod = eod.to(device)
+            gate_w = model.st_gating(eod)        # (B, N, 1, 1)
+            gate_w = gate_w.squeeze(-1).squeeze(-1)  # (B, N)
+            if gate_accum is None:
+                gate_accum = gate_w.sum(dim=0)
+            else:
+                gate_accum += gate_w.sum(dim=0)
+            n_samples += eod.size(0)
+    avg_w = (gate_accum / n_samples).cpu().numpy()  # (N,)
+
+    names = getattr(args, 'feature_names', [])
+    if len(names) < args.code_num:
+        names = names + [f"Var_{i}" for i in range(len(names), args.code_num)]
+
+    ranked = sorted(zip(names, avg_w), key=lambda t: t[1], reverse=True)
+
+    gating = getattr(args, 'gating_method', 'none')
+    sep = "=" * 70
+    print(f"\n{sep}")
+    print(f"         VARIABLE IMPORTANCE RANKING  [{gating.upper()} Gate]")
+    print(sep)
+    print(f"  {'Rank':>4s}  {'Variable':<16s}  {'Avg Gate Weight':>15s}  {'Status':<10s}")
+    print(f"  {'-'*50}")
+    for rank, (name, w) in enumerate(ranked, 1):
+        status = "RETAINED" if w > 0.5 else "SUPPRESSED"
+        print(f"  {rank:4d}  {name:<16s}  {w:15.4f}  {status:<10s}")
+    retained_count = sum(1 for _, w in ranked if w > 0.5)
+    print(f"\n  Retained / Total: {retained_count} / {args.code_num}")
+    print(sep, "\n")
+
+
+if __name__ == '__main__':
+    args = get_args()
+
+    args.train_index = int(args.trade_day * 0.7) - args.length - args.forecast_horizon
+    args.valid_index = int(args.trade_day * 0.8) - args.length - args.forecast_horizon
+
+    print_config(args)
+
+    all_result = main(args)
+
+    sep = "=" * 70
+    print(f"\n{sep}")
+    print("                    FINAL TEST RESULTS")
+    print(sep)
+    print(all_result.to_string(index=False))
+    print(sep)
