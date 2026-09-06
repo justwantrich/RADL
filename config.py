@@ -34,6 +34,10 @@ def get_args():
 
     parser.add_argument('-data_path', type=str, default="./data/GDEA.csv",
                         help="Path to the input data file (.csv or .xlsx)")
+    parser.add_argument('-output_dir', type=str, default="./output",
+                        help="Directory for predictions and test metrics")
+    parser.add_argument('-save_dir', type=str, default="./save_dict",
+                        help="Directory for model checkpoints")
     parser.add_argument('-drop_cols', nargs='*', default=[],
                         help="Column names to drop from data (e.g. -drop_cols AQI Temp)")
 
@@ -61,14 +65,35 @@ def get_args():
     parser.add_argument('-grad_clip', type=float, default=5.0,
                         help="Max global gradient norm (0 = disabled)")
 
-    parser.add_argument('-epoch', type=int, default=500, help="Number of training epochs")
+    parser.add_argument('-epoch', type=int, default=500,
+                        help="Number of training epochs")
     parser.add_argument('-batch_size', type=int, default=32, help="Batch size")
     parser.add_argument('-hidden_size', type=int, default=64, help="Number of hidden units")
 
     parser.add_argument('-blocks', type=int, default=3, help="Number of dilation blocks")
     parser.add_argument('-layers', type=int, default=3, help="Dilated conv layers per block")
+    parser.add_argument('-residual_channels', type=int, default=32,
+                        help="Residual channel width")
+    parser.add_argument('-dilation_channels', type=int, default=32,
+                        help="Dilation channel width")
+    parser.add_argument('-skip_channels', type=int, default=256,
+                        help="Skip channel width")
+    parser.add_argument('-end_channels', type=int, default=512,
+                        help="Output head channel width")
+    parser.add_argument('-gcn_order', type=int, choices=[1, 2], default=2,
+                        help="Graph diffusion order")
     parser.add_argument('-att_dim', type=int, default=8,
                         help="Embedding width of the latent correlation (attention) layer")
+    parser.add_argument('-att_init_gain', type=float, default=2.0,
+                        help="Xavier-uniform gain for attention key/query initialization")
+    parser.add_argument('-use_lag_graph', type=str2bool, default=False,
+                        help="Use lag-aware attention and delayed graph messages")
+    parser.add_argument('-backbone_norm', choices=['batch', 'channel'], default='batch',
+                        help="Backbone normalization: batch statistics or per-node channel LayerNorm")
+    parser.add_argument('-graph_lags', type=int, nargs='+', default=[0, 1, 2, 5],
+                        help="Unique lag offsets starting with 0, each smaller than lookback length")
+    parser.add_argument('-weight_average_k', type=int, default=0,
+                        help="Average the final K epoch checkpoints (0 = disabled)")
     parser.add_argument('-use_static_adj', type=str2bool, default=True,
                         help="Add a learned static adjacency alongside the per-window one")
 
@@ -91,7 +116,6 @@ def get_args():
                              "'mean' reduces to standard RevIN")
     parser.add_argument('-revin_affine', type=str2bool, default=True,
                         help="Learnable per-variable affine term (the RevIN paper's gamma/beta)")
-
     # Regime-aligned variable emphasis (gating)
     parser.add_argument('-gating_method', type=str, default="none",
                         choices=["none", "sigmoid", "gumbel"],
@@ -107,15 +131,29 @@ def get_args():
     parser.add_argument('-gumbel_tau_end', type=float, default=0.05,
                         help="[gumbel] Final temperature (low = hard selection)")
 
-    # Auxiliary supervision on the non-target variables
+    # Target loss and auxiliary supervision on the non-target variables
+    parser.add_argument('-target_mae_weight', type=float, default=0.0,
+                        help="Add this weight times target MAE to the target MSE loss")
+    parser.add_argument('-use_movement_gate', type=str2bool, default=False,
+                        help="Gate target corrections using graph-informed movement probability")
+    parser.add_argument('-movement_loss_weight', type=float, default=0.005,
+                        help="Weight of significant-movement classification loss")
+    parser.add_argument('-movement_threshold', type=float, default=0.02,
+                        help="Significant target change threshold in standardized units")
     parser.add_argument('-aux_loss_weight', type=float, default=0.0,
                         help="Weight for auxiliary multi-variable MSE (0 = off)")
 
     # Optimization schedule
     parser.add_argument('-early_stop_patience', type=int, default=60,
                         help="Early stopping patience in epochs (0 = disabled)")
+    parser.add_argument('-checkpoint_metric', choices=['mse', 'mae'], default='mse',
+                        help="Validation metric used for checkpoint selection and early stopping")
     parser.add_argument('-use_cosine_lr', type=str2bool, default=True,
                         help="Use cosine annealing LR schedule")
+    parser.add_argument('-refit_train_valid', type=str2bool, default=False,
+                        help="Fit the final model on train+validation for a fixed epoch count")
+    parser.add_argument('-refit_epochs', type=int, default=0,
+                        help="Epochs for train+validation refit; chosen on the earlier validation run")
 
     args = parser.parse_args()
 

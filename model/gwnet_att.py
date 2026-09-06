@@ -5,7 +5,7 @@ diffusion, following Graph WaveNet (Wu et al., IJCAI 2019).  The latent
 correlation layer follows the self-attention adjacency of StemGNN
 (Cao et al., NeurIPS 2020).  Both must be cited in the paper.
 
-RADL adds three things on top of that base:
+RADL adds the following on top of that base:
   1. Reversible instance normalization anchored at the most recent observation,
      applied inside the network so the forward pass cannot desynchronize
      from the inverse mapping.
@@ -14,6 +14,8 @@ RADL adds three things on top of that base:
      on the other windows that happen to share its batch -- at evaluation time
      that reads future observations.  Here each window builds its own graph.
   3. Optional regime-aligned variable gating with a sparsity penalty.
+  4. Optional lag-aware dynamic edges with matched delayed messages. Attention
+     uses the observed lookback only; static adjacency remains contemporaneous.
 """
 import math
 import torch
@@ -22,9 +24,19 @@ import torch.nn.functional as F
 
 
 class nconv(nn.Module):
-    """Graph diffusion step.  Support `a` is per-sample: (B, N_src, N_dst)."""
+    """Diffuse using (B, N_src, N_dst), or ((B, K, N_src, N_dst), lags).
+
+    Delays accumulate across diffusion hops. Missing left history is zero-filled.
+    """
 
     def forward(self, x, a):
+        if isinstance(a, tuple):
+            weights, lags = a  # (B, K, N_src, N_dst), offsets in trading steps
+            messages = []
+            for k, lag in enumerate(lags):
+                shifted = F.pad(x, (lag, 0))[..., :x.size(-1)] if lag else x
+                messages.append(torch.einsum('ncvt,nvw->ncwt', shifted, weights[:, k]))
+            return torch.stack(messages).sum(dim=0).contiguous()
         return torch.einsum('ncvl,nvw->ncwl', (x, a)).contiguous()
 
 
@@ -68,7 +80,7 @@ class RevIN(nn.Module):
 
     Follows Kim et al. (ICLR 2022), with one deviation: `anchor` selects the
     location statistic.  With anchor="last" the window is centred on the most
-    recent observation, so a network output of zero reproduces the random-walk
+    recent observation, so the normalized anchor reproduces the random-walk
     forecast exactly and the network only has to learn the departure from it.
     With anchor="mean" this reduces to standard RevIN.
 
@@ -137,14 +149,23 @@ class STGating(nn.Module):
         return torch.sigmoid(self.bottleneck_logits).mean()
 
 
+class ChannelLayerNorm(nn.LayerNorm):
+    """Normalize channels independently at each sample, node and time step."""
+
+    def forward(self, x):
+        return super().forward(x.movedim(1, -1)).movedim(-1, 1).contiguous()
+
+
 class gwnet(nn.Module):
     """RADL backbone.  Input (B, N, T, F) -> output (B, N, out_dim)."""
 
     def __init__(self, num_nodes, seq_length, dropout=0.3, in_dim=1, out_dim=1,
                  residual_channels=32, dilation_channels=32, skip_channels=256,
                  end_channels=512, kernel_size=2, blocks=3, layers=3,
-                 att_dim=8, gating_method="none", use_static_adj=True,
-                 use_revin=True, revin_anchor="last", revin_affine=True):
+                 att_dim=8, att_init_gain=2.0, gcn_order=2, gating_method="none", use_static_adj=True,
+                 use_revin=True, revin_anchor="last", revin_affine=True,
+                 use_lag_graph=False, graph_lags=(0, 1, 2, 5),
+                 backbone_norm="batch", use_movement_gate=False):
 
         super(gwnet, self).__init__()
 
@@ -155,6 +176,25 @@ class gwnet(nn.Module):
         self.layers = layers
         self.out_dim = out_dim
         self.att_dim = att_dim
+        self.att_init_gain = att_init_gain
+        if backbone_norm not in ('batch', 'channel'):
+            raise ValueError('backbone_norm must be batch or channel')
+        self.backbone_norm = backbone_norm
+        self.use_movement_gate = bool(use_movement_gate)
+        if self.use_movement_gate and (not use_revin or revin_anchor != 'last'):
+            raise ValueError('movement gate requires last-anchored RevIN')
+        self.use_lag_graph = bool(use_lag_graph)
+        self.graph_lags = tuple(graph_lags)
+        if self.use_lag_graph and (
+            not self.graph_lags or self.graph_lags[0] != 0
+            or len(set(self.graph_lags)) != len(self.graph_lags)
+            or any(not isinstance(lag, int) or lag < 0 or lag >= seq_length
+                   for lag in self.graph_lags)
+        ):
+            raise ValueError('graph_lags must start with 0 and contain unique integers in [0, seq_length).')
+        if gcn_order not in (1, 2):
+            raise ValueError(f"gcn_order must be 1 or 2, got {gcn_order!r}")
+        self.gcn_order = int(gcn_order)
 
         self.revin = RevIN(num_nodes, anchor=revin_anchor, affine=revin_affine) if use_revin else None
         self.st_gating = STGating(num_nodes, method=gating_method) if gating_method != "none" else None
@@ -171,9 +211,9 @@ class gwnet(nn.Module):
         # optional learned static adjacency (Graph WaveNet's adaptive matrix).
         # The static term is what stabilises the per-sample attention graph.
         self.weight_key = nn.Parameter(torch.zeros(size=(self.seq_length, att_dim)))
-        nn.init.xavier_uniform_(self.weight_key.data, gain=1.414)
+        nn.init.xavier_uniform_(self.weight_key.data, gain=att_init_gain)
         self.weight_query = nn.Parameter(torch.zeros(size=(self.seq_length, att_dim)))
-        nn.init.xavier_uniform_(self.weight_query.data, gain=1.414)
+        nn.init.xavier_uniform_(self.weight_query.data, gain=att_init_gain)
         self.supports_len = 1
 
         if use_static_adj:
@@ -197,30 +237,63 @@ class gwnet(nn.Module):
                                                      kernel_size=(1, 1)))
                 self.skip_convs.append(nn.Conv2d(in_channels=dilation_channels, out_channels=skip_channels,
                                                  kernel_size=(1, 1)))
-                self.bn.append(nn.BatchNorm2d(residual_channels))
+                self.bn.append(nn.BatchNorm2d(residual_channels) if backbone_norm == 'batch'
+                               else ChannelLayerNorm(residual_channels))
                 new_dilation *= 2
                 receptive_field += additional_scope
                 additional_scope *= 2
-                self.gconv.append(gcn(dilation_channels, residual_channels, dropout, support_len=self.supports_len))
+                self.gconv.append(gcn(dilation_channels, residual_channels, dropout,
+                                      support_len=self.supports_len, order=self.gcn_order))
 
         self.end_conv_1 = nn.Conv2d(in_channels=skip_channels, out_channels=end_channels, kernel_size=(1, 1), bias=True)
         self.end_conv_2 = nn.Conv2d(in_channels=end_channels, out_channels=self.out_dim, kernel_size=(1, 1), bias=True)
+        self.movement_conv = nn.Conv2d(end_channels, self.out_dim, kernel_size=(1, 1)) \
+            if self.use_movement_gate else None
+        if self.movement_conv is not None:
+            nn.init.zeros_(self.movement_conv.weight)
+            nn.init.constant_(self.movement_conv.bias, 1.0)
+        self.last_movement_logits = None
         self.receptive_field = receptive_field
 
-    def latent_correlation_layer(self, input_data):
+    def latent_correlation_layer(self, input_data, return_lags=False):
         """Per-sample dependency matrix, (B, N, N).
 
         attention[b, i, j] weights source variable i when aggregating into
         target variable j, so the softmax runs over the source axis (dim=1) to
         match the summation axis of nconv.
+        In lag mode return_lags=True exposes (B, K, N_src, N_dst); otherwise
+        the lag axis is summed for compatibility with attention visualizations.
         """
         input_data = input_data.mean(dim=1)                      # (B, N, T)
+        if self.use_lag_graph:
+            query = torch.matmul(input_data, self.weight_query)
+            scores = []
+            diagonal = torch.eye(self.num_nodes, device=input_data.device, dtype=torch.bool)
+            for lag in self.graph_lags:
+                # Zero-fill unavailable history; never wrap the window.
+                source = F.pad(input_data, (lag, 0))[..., :self.seq_length] if lag else input_data
+                key = torch.matmul(source, self.weight_key)
+                score = torch.bmm(key, query.transpose(1, 2)) / math.sqrt(self.att_dim)
+                # Own-history connections remain at lag 0; extra lag choices
+                # describe cross-variable messages.
+                if lag:
+                    score = score.masked_fill(diagonal.unsqueeze(0), float('-inf'))
+                scores.append(score)
+            logits = torch.stack(scores, dim=1)
+            # Joint normalization across lag AND source, for each destination.
+            weights = F.softmax(logits.flatten(1, 2), dim=1).reshape_as(logits)
+            return weights if return_lags else weights.sum(dim=1)
         key = torch.matmul(input_data, self.weight_key)          # (B, N, att_dim)
         query = torch.matmul(input_data, self.weight_query)      # (B, N, att_dim)
         attention = torch.bmm(key, query.permute(0, 2, 1).contiguous())
         return F.softmax(attention / math.sqrt(self.att_dim), dim=1)
 
-    def forward(self, my_input, return_att=False):
+    def forward(self, my_input, return_att=False, return_lag_att=False):
+        """Forecast from the observed window; optionally return dynamic weights.
+
+        return_lag_att takes precedence over return_att. With lag mode disabled
+        it returns a singleton lag axis representing lag 0.
+        """
         # my_input: (B, N, T, F)
         loc = scale = None
         if self.revin is not None:
@@ -230,8 +303,14 @@ class gwnet(nn.Module):
 
         my_input = my_input.permute(0, 3, 1, 2)  # (B, N, T, F) -> (B, F, N, T)
 
-        adp = self.latent_correlation_layer(my_input)
-        new_supports = [adp]
+        if self.use_lag_graph:
+            lag_adp = self.latent_correlation_layer(my_input, return_lags=True)
+            adp = lag_adp.sum(dim=1)
+            new_supports = [(lag_adp, self.graph_lags)]
+        else:
+            adp = self.latent_correlation_layer(my_input)
+            lag_adp = adp.unsqueeze(1)
+            new_supports = [adp]
         if self.nodevec1 is not None:
             # Column-stochastic so incoming weights sum to one over source nodes.
             static = F.softmax(F.relu(torch.mm(self.nodevec1, self.nodevec2)), dim=0)
@@ -247,9 +326,16 @@ class gwnet(nn.Module):
         skip = 0
         for i in range(self.blocks * self.layers):
             residual = x
-            my_filter = self.filter_convs[i](residual)
+            temporal_input = residual
+            if self.use_lag_graph:
+                # Keep the time axis available for delayed graph messages in
+                # every layer. Original valid convolutions shrink it to one.
+                conv = self.filter_convs[i]
+                left_pad = conv.dilation[-1] * (conv.kernel_size[-1] - 1)
+                temporal_input = F.pad(residual, (left_pad, 0))
+            my_filter = self.filter_convs[i](temporal_input)
             my_filter = torch.tanh(my_filter)
-            gate = self.gate_convs[i](residual)
+            gate = self.gate_convs[i](temporal_input)
             gate = torch.sigmoid(gate)
             x = my_filter * gate
             s = x
@@ -269,12 +355,25 @@ class gwnet(nn.Module):
         # which the downstream reshape silently misaligns.
         x = F.relu(skip[..., -1:])
         x = F.relu(self.end_conv_1(x))
+        head_features = x
         x = self.end_conv_2(x)                        # (B, out_dim, N, 1)
         out = x.squeeze(-1).transpose(1, 2)           # (B, N, out_dim)
+
+        if self.movement_conv is not None:
+            # Gate the target's learned correction using graph-informed features.
+            # In normalized space beta is the exact last-value anchor.
+            logits = self.movement_conv(head_features)
+            logits = logits.squeeze(-1).transpose(1, 2)
+            self.last_movement_logits = logits[:, 0, :]
+            anchor = self.revin.beta[0] if self.revin.affine else out.new_tensor(0.0)
+            target = anchor + torch.sigmoid(self.last_movement_logits) * (out[:, 0, :] - anchor)
+            out = torch.cat((target.unsqueeze(1), out[:, 1:, :]), dim=1)
 
         if self.revin is not None:
             out = self.revin.denormalize(out, loc, scale)
 
+        if return_lag_att:
+            return out, lag_adp
         if return_att:
             return out, adp
         return out

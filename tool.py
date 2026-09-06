@@ -6,7 +6,9 @@ the normalization from its inverse.
 """
 import os
 import time
+from collections import deque
 import torch
+import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 from math import sqrt
@@ -44,6 +46,26 @@ def _variant_tag(args) -> str:
         if not getattr(args, "revin_affine", True):
             rv += "-noaff"
     parts = [rv]
+    if getattr(args, 'backbone_norm', 'batch') != 'batch':
+        parts.append('norm-' + args.backbone_norm)
+    if getattr(args, 'gcn_order', 2) != 2:
+        parts.append('order' + str(args.gcn_order))
+    if getattr(args, 'refit_train_valid', False):
+        parts.append('refit' + str(args.refit_epochs))
+    if getattr(args, 'use_movement_gate', False):
+        parts.append('movegate')
+    if getattr(args, 'checkpoint_metric', 'mse') != 'mse':
+        parts.append('select-' + args.checkpoint_metric)
+    mae_weight = getattr(args, 'target_mae_weight', 0.0)
+    if mae_weight > 0:
+        parts.append(f"maew{mae_weight:g}".replace('.', 'p'))
+    if getattr(args, 'use_lag_graph', False):
+        parts.append('laggraph-' + '-'.join(str(lag) for lag in args.graph_lags))
+    att_gain = getattr(args, "att_init_gain", None)
+    # Preserve the historical baseline tag for the original Xavier gain;
+    # non-baseline ablations get an explicit suffix to prevent collisions.
+    if att_gain is not None and abs(float(att_gain) - 1.414) > 1e-12:
+        parts.append(f"att-g{att_gain:g}".replace(".", "p"))
     if not getattr(args, "use_static_adj", True):
         parts.append("nostatic")
     gating = getattr(args, "gating_method", "none")
@@ -60,7 +82,9 @@ def _build_run_tag(args) -> str:
 
 
 def _checkpoint_path(args) -> str:
-    return f"./save_dict/{args.forecast_horizon}/{args.model_name}_{_build_run_tag(args)}.chkpt"
+    return os.path.join(getattr(args, 'save_dir', './save_dict'),
+                        str(args.forecast_horizon),
+                        f"{args.model_name}_{_build_run_tag(args)}.chkpt")
 
 
 def _output_prefix(args) -> str:
@@ -108,6 +132,15 @@ def train_epoch(model, training_data, optimizer, device, args, epoch=0):
         pred = model(Eod).reshape(-1, args.code_num, args.forecast_horizon)
 
         loss = mse(pred, Gt)
+        mae_weight = getattr(args, 'target_mae_weight', 0.0)
+        if mae_weight > 0:
+            loss = loss + mae_weight * (pred[:, 0, :] - Gt[:, 0, :]).abs().mean()
+        if getattr(model, 'movement_conv', None) is not None:
+            origin = Eod[:, 0, -1, 0].unsqueeze(-1)
+            movement = ((Gt[:, 0, :] - origin).abs()
+                        > getattr(args, 'movement_threshold', 0.02)).to(pred.dtype)
+            loss = loss + getattr(args, 'movement_loss_weight', 0.005) * F.binary_cross_entropy_with_logits(
+                model.last_movement_logits, movement)
         if aux_weight > 0:
             loss = loss + aux_weight * ((pred[:, 1:, :] - Gt[:, 1:, :]) ** 2).mean()
         loss = loss + _gate_penalty(model, args, epoch)
@@ -158,10 +191,15 @@ def train(model, training_data, validation_data, optimizer, device, args, a, b, 
     os.makedirs(os.path.dirname(model_path), exist_ok=True)
 
     best_val_mse = float('inf')
+    best_score = float('inf')
+    selection_metric = getattr(args, 'checkpoint_metric', 'mse')
     best_epoch = -1
     total_train_time = 0.0
     patience = getattr(args, 'early_stop_patience', 0)
     epochs_no_improve = 0
+    average_k = max(0, int(getattr(args, 'weight_average_k', 0)))
+    recent_states = deque(maxlen=average_k or None)
+    parameter_names = set(dict(model.named_parameters()).keys())
 
     sep = "=" * 90
     print(f"\n{sep}")
@@ -174,6 +212,8 @@ def train(model, training_data, validation_data, optimizer, device, args, a, b, 
         print(f"  [Early Stop] patience = {patience}")
     if scheduler is not None:
         print(f"  [LR Schedule] CosineAnnealing")
+    if average_k > 0:
+        print(f"  [Weight Average] final {average_k} epoch checkpoints")
     print(f"{'Epoch':>11s} | {'Train Loss':>11s} | {'Val MSE':>10s} | "
           f"{'Val MAE':>10s} | {'Val RMSE':>10s} | {'LR':>10s} | {'Time':>6s} | Save")
     print("-" * 90)
@@ -187,12 +227,21 @@ def train(model, training_data, validation_data, optimizer, device, args, a, b, 
         if scheduler is not None:
             scheduler.step()
 
+        if average_k > 0:
+            # Keep CPU snapshots so averaging does not consume GPU memory.
+            recent_states.append({
+                name: value.detach().cpu().clone()
+                for name, value in model.state_dict().items()
+            })
+
         epoch_time = time.time() - epoch_start
         total_train_time += epoch_time
         current_lr = optimizer.param_groups[0]['lr']
 
         saved_flag = ""
-        if valid_mse < best_val_mse:
+        current_score = valid_mse if selection_metric == 'mse' else valid_mae
+        if current_score < best_score:
+            best_score = current_score
             best_val_mse = valid_mse
             best_epoch = epoch_i
             epochs_no_improve = 0
@@ -214,8 +263,58 @@ def train(model, training_data, validation_data, optimizer, device, args, a, b, 
     print(f"  Training complete!")
     print(f"  Total time   : {total_train_time:.1f}s ({total_train_time / 60:.1f} min)")
     print(f"  Best Val MSE : {best_val_mse:.6f} (epoch {best_epoch + 1})")
+    if selection_metric != 'mse':
+        print(f"  Selected by  : validation {selection_metric.upper()} = {best_score:.6f}")
     print(f"  Model saved  : {os.path.abspath(model_path)}")
     print(sep, "\n")
+
+    averaged = False
+    average_start_epoch = None
+    if average_k > 0 and recent_states:
+        average_start_epoch = epoch_i - len(recent_states) + 2
+        averaged_state = {}
+        for name in recent_states[0]:
+            values = [state[name] for state in recent_states]
+            if name in parameter_names:
+                averaged_state[name] = torch.stack(values, dim=0).mean(dim=0).to(values[0].dtype)
+            else:
+                # Keep non-parameter buffers from the final state. In
+                # particular, averaging BatchNorm running statistics is not
+                # equivalent to recalibrating them and can hurt evaluation.
+                averaged_state[name] = values[-1]
+        model.load_state_dict(averaged_state)
+        torch.save({
+            'model': averaged_state,
+            'settings': args,
+            'epoch': epoch_i,
+            'averaged': True,
+            'averaged_start_epoch': average_start_epoch,
+            'averaged_end_epoch': epoch_i + 1,
+        }, model_path)
+        averaged = True
+        print(f"  Averaged model : epochs {average_start_epoch}-{epoch_i + 1} ({len(recent_states)} states)")
+
+    return {
+        'best_val_mse': best_val_mse,
+        'best_epoch': best_epoch,
+        'completed_epochs': epoch_i + 1,
+        'averaged': averaged,
+        'averaged_start_epoch': average_start_epoch,
+    }
+
+
+def train_fixed(model, training_data, optimizer, device, args, scheduler=None):
+    """Refit a chosen configuration on all pre-test data for fixed epochs."""
+    model_path = _checkpoint_path(args)
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
+    for epoch_i in range(args.refit_epochs):
+        loss = train_epoch(model, training_data, optimizer, device, args=args, epoch=epoch_i)
+        if scheduler is not None:
+            scheduler.step()
+        print(f"[Refit {epoch_i + 1:4d}/{args.refit_epochs:4d}] loss={loss:.6f}")
+    torch.save({'model': model.state_dict(), 'settings': args,
+                'epoch': args.refit_epochs - 1, 'refit': True}, model_path)
+    print(f"[Info] Refit model saved: {os.path.abspath(model_path)}")
 
 
 def _naive_forecast(raw_y, start_idx, n_windows, horizon):
@@ -292,7 +391,8 @@ def test(model, test_data, optimizer, device, args, a, b):
         "Naive": y_naive_1d,
     })
 
-    out_dir = "./output/{}".format(args.forecast_horizon)
+    out_dir = os.path.join(getattr(args, 'output_dir', './output'),
+                           str(args.forecast_horizon))
     os.makedirs(out_dir, exist_ok=True)
     prefix = _output_prefix(args)
     pred_path = f"{out_dir}/pred_df_{prefix}.csv"
