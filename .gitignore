@@ -1,0 +1,39 @@
+# Python and local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Local training artifacts
+output/
+results/
+save_dict/
+stage*_logs/
+node_modules/
+
+# Local experiment runners and analysis exports
+benchmark*.py
+collect_*.py
+cv_selection.py
+experiment*.py
+stage*_experiment.py
+stage*_final_only.py
+stage*_cv_selection.py
+run_stage*.ps1
+make_FOR_results.mjs
+verify_FOR_results.mjs
+HYPERPARAMETER_TABLE.md
+hyperparameters_table.tex
+hyperparameters.csv
+
+# Generated or synthetic local data; keep the checked-in source datasets
+data/*_1.csv
+data/*synthetic_metadata.json
+data/_hbea_write_test.csv
+data/README_SYNTHETIC.md
+data/generate_predictive_synthetic_data.py
+
+# Local backup copies
+radl(2)/

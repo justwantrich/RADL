@@ -10,8 +10,8 @@ import pandas as pd
 import torch
 import torch.optim as optim
 
-from load_data import load_EOD_data, prepare_dataloaders
-from tool import train, test
+from load_data import load_EOD_data, prepare_dataloaders, prepare_refit_loader
+from tool import train, train_fixed, test
 from config import get_args
 from set_model import get_model
 
@@ -27,8 +27,9 @@ def inspect_data(eod_data, train_loader, valid_loader, test_loader, args, a, b):
           f"-> (code_num={args.code_num}, trade_day={args.trade_day}, fea_num={args.fea_num})")
     print(f"    First 5 time steps of variable 0:")
     print(f"      {eod_data[0, :5, 0]}")
-    print(f"    First 5 time steps of variable 1:")
-    print(f"      {eod_data[1, :5, 0]}")
+    if eod_data.shape[0] > 1:
+        print(f"    First 5 time steps of variable 1:")
+        print(f"      {eod_data[1, :5, 0]}")
 
     print("\n[2] Batch Dimension Check")
     for name, loader in [("Train", train_loader), ("Valid", valid_loader), ("Test", test_loader)]:
@@ -100,7 +101,16 @@ def print_config(args):
     print(f"  --- RADL components ---")
     print(f"  RevIN             : {args.use_revin}"
           + (f"  (anchor={args.revin_anchor}, affine={args.revin_affine})" if args.use_revin else ""))
-    print(f"  Backbone          : blocks={args.blocks}, layers={args.layers}, att_dim={args.att_dim}")
+    print(f"  Backbone          : blocks={args.blocks}, layers={args.layers}, "
+          f"residual={args.residual_channels}, dilation={args.dilation_channels}, "
+          f"skip={args.skip_channels}, end={args.end_channels}, gcn_order={args.gcn_order}, "
+          f"att_dim={args.att_dim}")
+    print(f"  Attention init    : Xavier uniform (gain={args.att_init_gain})")
+    print(f"  Backbone norm     : {getattr(args, 'backbone_norm', 'batch')}")
+    if getattr(args, 'use_lag_graph', False):
+        print(f"  Lag-aware graph   : lags={args.graph_lags}")
+    if getattr(args, 'weight_average_k', 0) > 0:
+        print(f"  Weight averaging  : final {args.weight_average_k} epochs")
     print(f"  Static adjacency  : {args.use_static_adj}")
     gating = getattr(args, 'gating_method', 'none')
     print(f"  Gating method     : {gating}")
@@ -113,10 +123,20 @@ def print_config(args):
             print(f"    tau               : {args.gumbel_tau_start} -> {args.gumbel_tau_end}")
     if args.aux_loss_weight > 0:
         print(f"  Aux loss weight   : {args.aux_loss_weight}")
+    if getattr(args, 'target_mae_weight', 0.0) > 0:
+        print(f"  Target MAE weight : {args.target_mae_weight}")
+    if getattr(args, 'use_movement_gate', False):
+        print(f"  Movement gate     : threshold={args.movement_threshold}, "
+              f"loss_weight={args.movement_loss_weight}")
     if args.early_stop_patience > 0:
         print(f"  Early stop        : patience={args.early_stop_patience}")
+    else:
+        print(f"  Early stop        : disabled")
     if args.use_cosine_lr:
-        print(f"  LR schedule       : CosineAnnealing")
+        print(f"  LR schedule       : CosineAnnealing (T_max={args.epoch})")
+    print(f"  Checkpoint metric : {getattr(args, 'checkpoint_metric', 'mse')}")
+    if getattr(args, 'refit_train_valid', False):
+        print(f"  Final refit       : train+validation, {args.refit_epochs} epochs")
     print(sep)
 
 
@@ -189,7 +209,13 @@ def main(args):
     if args.use_cosine_lr:
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epoch, eta_min=args.lr * 0.01)
 
-    train(model, train_loader, valid_loader, optimizer, device, args, a, b, scheduler=scheduler)
+    if getattr(args, 'refit_train_valid', False):
+        if args.refit_epochs <= 0:
+            raise ValueError('-refit_epochs must be positive when -refit_train_valid is true')
+        refit_loader = prepare_refit_loader(eod_data, args)
+        train_fixed(model, refit_loader, optimizer, device, args, scheduler=scheduler)
+    else:
+        train(model, train_loader, valid_loader, optimizer, device, args, a, b, scheduler=scheduler)
 
     result = test(model, test_loader, optimizer, device, args, a, b)
 

@@ -31,7 +31,8 @@ def scale(args, data):
     Returns:
         (scaled data, per-variable means, per-variable stds).
     """
-    n_train = int(args.trade_day * args.train_ratio)
+    ratio = args.valid_ratio if getattr(args, 'refit_train_valid', False) else args.train_ratio
+    n_train = int(args.trade_day * ratio)
     if n_train < 2:
         raise ValueError(f"Training split has {n_train} rows; need at least 2 to estimate scale.")
 
@@ -81,13 +82,19 @@ def get_batch(eod_data, offset, seq_len, out_len):
             eod_data[:, offset + seq_len:offset + seq_len + out_len, 0])
 
 
-def prepare_dataloaders(eod_data, args):
-    """Sliding-window tensors wrapped in chronologically split DataLoaders."""
+def make_window_arrays(eod_data, args):
+    """Materialise all chronological sliding windows before any split."""
     n_windows = eod_data.shape[1] - args.length - args.forecast_horizon + 1
     EOD = np.empty((n_windows, args.code_num, args.length, args.fea_num), dtype=np.float32)
     GT = np.empty((n_windows, args.code_num, args.forecast_horizon), dtype=np.float32)
     for i in range(n_windows):
         EOD[i], GT[i] = get_batch(eod_data, i, args.length, args.forecast_horizon)
+    return EOD, GT
+
+
+def prepare_dataloaders(eod_data, args):
+    """Sliding-window tensors wrapped in chronologically split DataLoaders."""
+    EOD, GT = make_window_arrays(eod_data, args)
 
     train_eod, train_gt = EOD[:args.train_index], GT[:args.train_index]
     valid_eod, valid_gt = EOD[args.train_index:args.valid_index], GT[args.train_index:args.valid_index]
@@ -104,3 +111,11 @@ def prepare_dataloaders(eod_data, args):
     return (loader(train_eod, train_gt, shuffle=True, drop_last=True),
             loader(valid_eod, valid_gt),
             loader(test_eod, test_gt))
+
+
+def prepare_refit_loader(eod_data, args):
+    """Use all pre-test windows after model choices have been fixed on validation."""
+    EOD, GT = make_window_arrays(eod_data, args)
+    dataset = Data.TensorDataset(torch.from_numpy(EOD[:args.valid_index]),
+                                 torch.from_numpy(GT[:args.valid_index]))
+    return Data.DataLoader(dataset, batch_size=args.batch_size, shuffle=True, drop_last=True)
