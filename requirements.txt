@@ -1,0 +1,11 @@
+numpy
+pandas
+scipy
+scikit-learn
+torch
+matplotlib
+tqdm
+omegaconf
+einops
+tensorboard
+openpyxl
